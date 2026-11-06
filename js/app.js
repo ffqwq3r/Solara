@@ -117,6 +117,7 @@ import {
     setAudioCurrentTime,
     playSong,
     autoPlayNext,
+    prefetchNextAudioUrl,
     playNext,
     playPrevious,
     downloadSong,
@@ -348,7 +349,7 @@ export async function playFavoriteSong(index, options = {}) {
 }
 
 // 播放搜索结果单曲
-export async function playSearchResult(index) {
+export async function playSearchResult(index, options = {}) {
     if (index < 0 || index >= state.searchResults.length) return;
     const song = state.searchResults[index];
     if (!song) return;
@@ -374,7 +375,7 @@ export async function playSearchResult(index) {
     savePlayerState();
 
     try {
-        await playSong(song, {}, state, dom, getAudioCallbacks(), debugLog);
+        await playSong(song, options, state, dom, getAudioCallbacks(), debugLog);
         updatePlaylistHighlight(state, dom);
         updatePlayModeUI(state, dom);
     } catch (error) {
@@ -767,7 +768,11 @@ function setupEventHandlers() {
     // Audio 原生事件
     dom.audioPlayer.addEventListener("play", () => updatePlayPauseButton(dom));
     dom.audioPlayer.addEventListener("pause", () => updatePlayPauseButton(dom));
-    dom.audioPlayer.addEventListener("ended", () => autoPlayNext(state, dom, getAudioCallbacks()));
+    dom.audioPlayer.addEventListener("playing", () => prefetchNextAudioUrl(state));
+    dom.audioPlayer.addEventListener("ended", () => {
+        debugLog(`[音频续播] ended ${new Date().toISOString()}`);
+        autoPlayNext(state, dom, getAudioCallbacks());
+    });
     dom.audioPlayer.addEventListener("timeupdate", () => {
         const currentTime = dom.audioPlayer.currentTime || 0;
         if (!state.isSeeking) {

@@ -270,9 +270,57 @@ export function cancelPendingPlayback() {
     currentPlaybackToken++;
 }
 
+function audioCacheKey(song, quality) {
+    return `${song.source || 'netease'}_${song.id}_${quality}`;
+}
+
+function cachedAudioUrl(song, quality) {
+    const key = audioCacheKey(song, quality);
+    const entry = audioUrlMemoryCache.get(key);
+    if (entry && Date.now() - entry.timestamp < AUDIO_URL_CACHE_TTL) return entry.url;
+    audioUrlMemoryCache.delete(key);
+    return null;
+}
+
+async function resolveAudioUrl(song, quality, isRetry, log) {
+    let url = API.getSongUrl(song, quality);
+    if (isRetry) url += '&nocache=true';
+    log(`[音频解析] 请求接口: ${url}`);
+    const data = await API.fetchJson(url);
+    if (!data?.url) throw new Error('无法获取音频播放地址');
+    audioUrlMemoryCache.set(audioCacheKey(song, quality), {
+        url: data.url,
+        timestamp: Date.now()
+    });
+    return data.url;
+}
+
+let prefetchingAudioKey;
+
+export function prefetchNextAudioUrl(state) {
+    if (getActivePlayMode(state) !== "list") return;
+    const favorite = state.currentList === "favorite";
+    const songs = favorite ? ensureFavoriteSongsArray(state) : {
+        playlist: state.playlistSongs,
+        online: state.onlineSongs,
+        search: state.searchResults
+    }[state.currentPlaylist];
+    if (!songs?.length) return;
+    const index = favorite ? state.currentFavoriteIndex : state.currentTrackIndex;
+    const song = songs[(index + 1) % songs.length];
+    const quality = state.playbackQuality || "320";
+    if (!song || cachedAudioUrl(song, quality)) return;
+    const key = audioCacheKey(song, quality);
+    if (prefetchingAudioKey === key) return;
+    prefetchingAudioKey = key;
+    resolveAudioUrl(song, quality, false, () => {}).catch(() => {}).finally(() => {
+        if (prefetchingAudioKey === key) prefetchingAudioKey = null;
+    });
+}
+
 export async function playSong(song, options = {}, state, dom, callbacks = {}, debugLogger = null) {
     const myToken = ++currentPlaybackToken;
-    const { autoplay = true, startTime = 0, preserveProgress = false, isRetry = false } = options;
+    const { autoplay = true, startTime = 0, preserveProgress = false, isRetry = false, fromEnded = false } = options;
 
     state.audioReadyForPalette = false;
 
@@ -289,45 +337,9 @@ export async function playSong(song, options = {}, state, dom, callbacks = {}, d
         const quality = state.playbackQuality || '320';
         log(`[音频播放] 准备加载: ${song.name || "未知歌曲"} (音质: ${quality}k, 来源: ${song.source || 'netease'})`);
 
-        const cacheKey = `${song.source || 'netease'}_${song.id}_${quality}`;
-        let originalAudioUrl = null;
-
-        // 1. 优先命中前端内存短期直链缓存（0 网络请求）
-        if (!isRetry && audioUrlMemoryCache.has(cacheKey)) {
-            const cachedItem = audioUrlMemoryCache.get(cacheKey);
-            if (Date.now() - cachedItem.timestamp < AUDIO_URL_CACHE_TTL && cachedItem.url) {
-                originalAudioUrl = cachedItem.url;
-                log(`[音频缓存] 命中内存直链: ${song.name} (${quality}k)，省去 1 次网络请求`);
-            } else {
-                audioUrlMemoryCache.delete(cacheKey);
-            }
-        }
-
-        // 2. 未命中或重试时，发起实际网络请求
-        if (!originalAudioUrl) {
-            let audioUrl = API.getSongUrl(song, quality);
-            if (isRetry) {
-                audioUrl += '&nocache=true';
-                log(`[音频重试] 正在通过非缓存链路重试请求...`);
-            }
-            log(`[音频解析] 请求接口: ${audioUrl}`);
-
-            const audioData = await API.fetchJson(audioUrl);
-            if (myToken !== currentPlaybackToken) {
-                return;
-            }
-
-            if (!audioData || !audioData.url) {
-                throw new Error('无法获取音频播放地址');
-            }
-
-            originalAudioUrl = audioData.url;
-            // 存入短期缓存（15分钟有效）
-            audioUrlMemoryCache.set(cacheKey, {
-                url: originalAudioUrl,
-                timestamp: Date.now()
-            });
-        }
+        const originalAudioUrl = (!isRetry && cachedAudioUrl(song, quality))
+            || await resolveAudioUrl(song, quality, isRetry, log);
+        if (myToken !== currentPlaybackToken) return;
 
         log(`[音频地址] 解析就绪: ${originalAudioUrl.slice(0, 50)}...`);
         const proxiedAudioUrl = buildAudioProxyUrl(originalAudioUrl);
@@ -362,6 +374,7 @@ export async function playSong(song, options = {}, state, dom, callbacks = {}, d
 
         state.pendingSeekTime = startTime > 0 ? startTime : null;
 
+        const startImmediately = fromEnded && autoplay && startTime === 0;
         let selectedAudioUrl = null;
         let lastAudioError = null;
 
@@ -370,10 +383,18 @@ export async function playSong(song, options = {}, state, dom, callbacks = {}, d
             dom.audioPlayer.load();
 
             try {
-                await waitForAudioReady(dom.audioPlayer);
+                if (startImmediately) {
+                    log("[音频续播] 调用 play()");
+                    await dom.audioPlayer.play();
+                } else {
+                    await waitForAudioReady(dom.audioPlayer);
+                }
+                if (myToken !== currentPlaybackToken) return;
                 selectedAudioUrl = candidateUrl;
                 break;
             } catch (error) {
+                if (myToken !== currentPlaybackToken) return;
+                if (error?.name === "NotAllowedError") throw error;
                 lastAudioError = error;
             }
         }
@@ -404,7 +425,7 @@ export async function playSong(song, options = {}, state, dom, callbacks = {}, d
         let playPromise = null;
         log(`[音频解码] 缓冲就绪 (${autoplay ? '开始自动播放' : '静音待播'})`);
 
-        if (autoplay) {
+        if (autoplay && !startImmediately) {
             playPromise = dom.audioPlayer.play();
             if (playPromise !== undefined) {
                 playPromise.catch(async error => {
@@ -421,7 +442,7 @@ export async function playSong(song, options = {}, state, dom, callbacks = {}, d
                     }
                 });
             }
-        } else {
+        } else if (!autoplay) {
             dom.audioPlayer.pause();
             updatePlayPauseButton(dom);
         }
@@ -435,8 +456,10 @@ export async function playSong(song, options = {}, state, dom, callbacks = {}, d
             window.__SOLARA_UPDATE_MEDIA_METADATA();
         }
     } catch (error) {
+        if (myToken !== currentPlaybackToken) return;
         console.error('播放歌曲失败:', error);
-        if (!isRetry) {
+        log(`[音频异常] ${error?.name || "Error"}: ${error?.message || error}`);
+        if (!isRetry && error?.name !== "NotAllowedError") {
             return playSong(song, { ...options, isRetry: true }, state, dom, callbacks, debugLogger);
         }
         throw error;
@@ -448,10 +471,6 @@ export async function playSong(song, options = {}, state, dom, callbacks = {}, d
 }
 
 export function autoPlayNext(state, dom, callbacks = {}) {
-    if (dom.audioPlayer && dom.audioPlayer.__solaraMediaSessionHandledEnded === 'skip') {
-        dom.audioPlayer.__solaraMediaSessionHandledEnded = false;
-        return;
-    }
     const mode = getActivePlayMode(state);
     if (mode === "single") {
         dom.audioPlayer.currentTime = 0;
@@ -459,11 +478,11 @@ export function autoPlayNext(state, dom, callbacks = {}) {
         return;
     }
 
-    playNext(state, dom, callbacks);
+    playNext(state, dom, callbacks, { fromEnded: true });
     updatePlayPauseButton(dom);
 }
 
-export function playNext(state, dom, callbacks = {}) {
+export function playNext(state, dom, callbacks = {}, options = {}) {
     if (state.currentList === "favorite") {
         const favorites = ensureFavoriteSongsArray(state);
         if (favorites.length === 0) {
@@ -481,7 +500,7 @@ export function playNext(state, dom, callbacks = {}) {
             state.currentFavoriteIndex = nextIndex;
         }
         if (typeof callbacks.playFavoriteSong === "function") {
-            callbacks.playFavoriteSong(state.currentFavoriteIndex);
+            callbacks.playFavoriteSong(state.currentFavoriteIndex, options);
         }
         return;
     }
@@ -518,11 +537,11 @@ export function playNext(state, dom, callbacks = {}) {
     const targetIndex = mode === "single" ? state.currentTrackIndex : nextIndex;
 
     if (state.currentPlaylist === "playlist" && typeof callbacks.playPlaylistSong === "function") {
-        callbacks.playPlaylistSong(targetIndex);
+        callbacks.playPlaylistSong(targetIndex, options);
     } else if (state.currentPlaylist === "online" && typeof callbacks.playOnlineSong === "function") {
-        callbacks.playOnlineSong(targetIndex);
+        callbacks.playOnlineSong(targetIndex, options);
     } else if (state.currentPlaylist === "search" && typeof callbacks.playSearchResult === "function") {
-        callbacks.playSearchResult(targetIndex);
+        callbacks.playSearchResult(targetIndex, options);
     }
 }
 
